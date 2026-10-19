@@ -1,81 +1,152 @@
 // SPDX-License-Identifier: MIT
+import { withMetrics } from "@/lib/metrics-middleware";
 
+import crypto from "crypto";
 import prisma from "@/lib/prisma";
-import { createPaymentSchema, paginationSchema } from "@/lib/validation-schemas";
 import {
-  successResponse,
-  validationError,
-  unauthorizedError,
-  handleApiError,
-} from "@/lib/api-response";
+  problemBadRequest,
+  problemFromError,
+  problemFromLegacyResponse,
+  problemFromZodError,
+  problemUnauthorized,
+} from "@/lib/api-errors";
+import { successResponse } from "@/lib/api-response";
+import { createPaymentSchema, paginationSchema } from "@/lib/validation-schemas";
 import { logger } from "@/lib/logger";
+import { withRequestLogging } from "@/lib/request-logging";
 import { getAuthContext } from "@/lib/auth-session";
+import { verifyCsrf } from "@/lib/csrf";
 import { dispatchWebhookEventAsync } from "@/lib/webhook-dispatcher";
 import { WEBHOOK_EVENTS } from "@/app/api/webhooks/event-types";
 import { incMetric } from "@/lib/metrics-counters";
+import { buildPaymentWhere } from "@/lib/payment-filters";
+import { invalidateCaches } from "@/lib/api-cache";
+import {
+  buildCursorWhere,
+  computeNextCursor,
+  computePagination,
+  decodeCursor,
+  prismaPagination,
+} from "@/lib/pagination-utils";
 
-export async function GET(request: Request) {
+export const GET = withMetrics("GET /api/payments", withRequestLogging(async function GET(request: Request) {
+  // Errors on this endpoint are RFC 7807 problem documents (issue #1364), so
+  // the SDK can read one shape for both the list and the mutations.
+  const instance = new URL(request.url).pathname;
   try {
     const auth = await getAuthContext(request);
     if (!auth) {
-      return unauthorizedError(
-        "Authentication required. Connect your wallet or provide an API key."
-      );
+      return problemUnauthorized(undefined, { instance });
     }
 
     const { searchParams } = new URL(request.url);
+    const explicitPage = searchParams.get("page");
+    // `?? undefined` matters: searchParams.get() returns null for absent
+    // params, and the schema's defaults/optionals only apply to undefined.
     const parsed = paginationSchema.safeParse({
-      page: searchParams.get("page"),
-      limit: searchParams.get("limit"),
-      status: searchParams.get("status"),
-      search: searchParams.get("search"),
+      page: explicitPage ?? undefined,
+      limit: searchParams.get("limit") ?? undefined,
+      cursor: searchParams.get("cursor") ?? undefined,
+      status: searchParams.get("status") ?? undefined,
+      search: searchParams.get("search") ?? undefined,
     });
 
-    if (!parsed.success) return validationError(parsed.error);
+    if (!parsed.success) return problemFromZodError(parsed.error, { instance });
 
-    const { page, limit, status, search } = parsed.data;
+    const { page, limit, status, search, cursor: rawCursor } = parsed.data;
 
-    // Always scope to the authenticated user — never expose other users' data
-    const where: Record<string, unknown> = { userId: auth.userId };
-    if (status) where.status = status;
-    if (search) {
-      where.OR = [
-        { description: { contains: search } },
-        { memo: { contains: search } },
-        { transactionHash: { contains: search } },
-      ];
+    // Soft-deleted rows are hidden by default (issue #50). `includeDeleted`
+    // is the explicit admin/debug opt-in to see them — it never crosses user
+    // boundaries, the result is still scoped to the authenticated user.
+    const includeDeleted = searchParams.get("includeDeleted") === "true";
+
+    // Always scope to the authenticated user — never expose other users' data.
+    // `status` and `search` (memo ILIKE + exact tx-hash, Issue #157) use the
+    // shared helper so the list route and CSV export stay in lockstep.
+    const baseWhere = buildPaymentWhere(auth.userId, { status, search });
+    if (!includeDeleted) baseWhere.deletedAt = null;
+
+    // Keyset (cursor) pagination is the default for plain list requests — it
+    // never deep-skips, so later pages stay fast as the table grows. Offset
+    // pagination via an explicit `page` param is kept for legacy consumers.
+    const cursor = rawCursor ? decodeCursor(rawCursor) : null;
+    if (rawCursor && !cursor) {
+      return problemBadRequest("Invalid cursor", {
+        instance,
+        code: "INVALID_CURSOR",
+      });
+    }
+    if (cursor !== null && explicitPage !== null) {
+      return problemBadRequest("page and cursor cannot both be used", {
+        instance,
+      });
     }
 
+    // Keyset mode (default): fetch limit + 1 rows to learn whether another
+    // page exists. The COUNT is expensive, so it only runs when the caller
+    // explicitly asks for meta.total via includeTotal=true.
+    if (cursor !== null || explicitPage === null) {
+      const where = buildCursorWhere(baseWhere, cursor);
+      const rows = await prisma.payment.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        // Fetch one extra row to learn whether another page exists.
+        take: limit + 1,
+      });
+      const visible = rows.slice(0, limit);
+      const { nextCursor, hasMore } = computeNextCursor(rows, limit);
+      const meta: Record<string, unknown> = { limit, nextCursor, hasMore };
+      if (searchParams.get("includeTotal") === "true") {
+        meta.total = await prisma.payment.count({ where: baseWhere });
+      }
+      return successResponse(visible, meta);
+    }
+
+    // Legacy offset mode: an explicit `page` param. Needs the COUNT to build
+    // the navigation meta (totalPages / hasNext / hasPrev).
     const [payments, total] = await Promise.all([
       prisma.payment.findMany({
-        where,
-        orderBy: { createdAt: "desc" },
-        skip: (page - 1) * limit,
-        take: limit,
+        where: baseWhere,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        ...prismaPagination(page, limit),
       }),
-      prisma.payment.count({ where }),
+      prisma.payment.count({ where: baseWhere }),
     ]);
 
-    logger.request("GET", `/api/payments?page=${page}&limit=${limit}`, 200, 0);
-
-    return successResponse(payments, { page, limit, total });
+    return successResponse(payments, {
+      ...computePagination(page, limit, total),
+      // Keyset-shaped fields kept for consumers that page via hasMore;
+      // offset mode never returns a cursor.
+      nextCursor: null,
+      hasMore: page * limit < total,
+    });
   } catch (err) {
-    return handleApiError(err, "GET /api/payments");
+    return problemFromError(err, instance);
   }
-}
+}));
 
-export async function POST(request: Request) {
+export const POST = withMetrics("POST /api/payments", withRequestLogging(async function POST(request: Request) {
+  const instance = new URL(request.url).pathname;
   try {
+    const csrfError = verifyCsrf(request);
+    // The CSRF guard runs before this handler and answers in the legacy
+    // envelope; re-render it so no error on this route bypasses RFC 7807.
+    if (csrfError) return problemFromLegacyResponse(csrfError, instance);
+
     const auth = await getAuthContext(request);
     if (!auth) {
-      return unauthorizedError(
-        "Authentication required. Connect your wallet or provide an API key."
-      );
+      return problemUnauthorized(undefined, { instance });
     }
 
-    const body = await request.json();
+    // A body that is not JSON is a client error (400), not a server fault —
+    // `request.json()` throws a SyntaxError that would otherwise classify as 500.
+    const body = await request.json().catch(() => null);
+    if (body === null) {
+      return problemBadRequest("Request body must be valid JSON", { instance });
+    }
+
     const parsed = createPaymentSchema.safeParse(body);
-    if (!parsed.success) return validationError(parsed.error);
+    if (!parsed.success) return problemFromZodError(parsed.error, { instance });
 
     const payment = await prisma.payment.create({
       data: {
@@ -84,6 +155,9 @@ export async function POST(request: Request) {
         assetIssuer: parsed.data.assetIssuer,
         description: parsed.data.description,
         memo: parsed.data.memo,
+        // Server-generated idempotency key — every attempt (original or
+        // retried) carries its own key, so attempts are never confused.
+        idempotencyKey: crypto.randomUUID(),
         status: "CREATED",
         // The authenticated user owns the record; sourceAccountId is a
         // Stellar account reference, NOT the User FK (previously this
@@ -109,8 +183,18 @@ export async function POST(request: Request) {
 
     incMetric("payments_created_total");
 
+    // Explicit cache invalidation (#741): a new payment changes the aggregate
+    // stats, this user's analytics, and the audit ledger (recording a payment
+    // appends an on-chain audit entry). Analytics is invalidated per-user so
+    // one tenant's write never flushes everyone else's cached aggregates.
+    await invalidateCaches([
+      { scope: "stats" },
+      { scope: "analytics", subject: auth.userId },
+      { scope: "audit-log" },
+    ]);
+
     return successResponse(payment, undefined, 201);
   } catch (err) {
-    return handleApiError(err, "POST /api/payments");
+    return problemFromError(err, instance);
   }
-}
+}));

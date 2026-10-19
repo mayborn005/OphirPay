@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+import { withMetrics } from "@/lib/metrics-middleware";
 
 /**
  * SSE (Server-Sent Events) endpoint for real-time payment event streaming.
@@ -9,202 +10,99 @@
  * - connected — stream established
  * - heartbeat — keep-alive ping every 15 seconds
  * - payment:created — new payment event detected from emitter contract
+ * - error — slow-consumer disconnect (see docs/SSE.md)
  *
- * This endpoint polls the PaymentEventEmitter contract on Stellar Testnet
- * every 10 seconds to detect new payment events in real-time.
+ * The stream comes from the shared `createLiveEventSource` (also used by the
+ * WebSocket channel), so both transports deliver the same events.
+ *
+ * ## Backpressure (issue #744)
+ *
+ * Frames go through `createBoundedSseBuffer`, which caps the per-connection
+ * outbound queue (events + bytes) and applies a documented slow-consumer
+ * policy — drop-oldest with a `: dropped N …` marker. A stalled client can
+ * therefore never grow server memory without bound, and the
+ * `ophirpay_sse_open_connections` gauge is released on teardown.
  */
 
-import {
-  rpc,
-  Contract,
-  TransactionBuilder,
-  scValToNative,
-  nativeToScVal,
-} from "@stellar/stellar-sdk";
-import { EMITTER_CONTRACT_ID, CHAIN_READ_SOURCE } from "@/lib/contracts";
-import { SOROBAN_RPC_URL, NETWORK_PASSPHRASE } from "@/lib/stellar";
+import { createLiveEventSource } from "@/lib/events/event-source";
+import { createBoundedSseBuffer } from "@/lib/events/sse-buffer";
+import { incMetric } from "@/lib/metrics-counters";
 
 export const dynamic = "force-dynamic";
 
-/**
- * Read a u64 value from the emitter contract using Soroban simulation.
- */
-async function readEmitterU64(
-  server: rpc.Server,
-  contractId: string,
-  functionName: string,
-  sourcePublicKey: string,
-): Promise<number> {
-  const contract = new Contract(contractId);
-  const account = await server.getAccount(sourcePublicKey);
+/** Maximum buffered events per connection before the policy applies. */
+export const SSE_MAX_BUFFERED_EVENTS = 100;
+/** Maximum buffered bytes per connection before the policy applies. */
+export const SSE_MAX_BUFFERED_BYTES = 256 * 1024;
+/** Close a backlogged connection that hasn't drained within this budget. */
+export const SSE_IDLE_TIMEOUT_MS = 60_000;
+/** Heartbeat cadence — also keeps proxies from closing an idle stream. */
+export const SSE_HEARTBEAT_MS = 15_000;
 
-  const tx = new TransactionBuilder(account, {
-    fee: "100000",
-    networkPassphrase: NETWORK_PASSPHRASE,
-    timebounds: { minTime: 0, maxTime: 0 },
-  })
-    .addOperation(contract.call(functionName))
-    .build();
+export const GET = withMetrics("GET /api/events", async function GET(request: Request) {
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let source: ReturnType<typeof createLiveEventSource> | null = null;
 
-  const simResponse = await server.simulateTransaction(tx);
+  // Release the connection exactly once — from the client abort, an overflow
+  // disconnect, or a stream cancel.
+  const teardown = () => {
+    if (closed) return;
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
+    if (source) source.stop();
+    // Release the connection from the `ophirpay_sse_open_connections` gauge
+    // (visible on /api/metrics) so operators and the SSE load test can verify
+    // connections are released when clients disconnect.
+    incMetric("sse_open_connections", -1);
+  };
 
-  if ("error" in simResponse && simResponse.error) {
-    return 0;
-  }
+  let lastDropped = 0;
+  const buffer = createBoundedSseBuffer({
+    policy: "drop-oldest",
+    maxEvents: SSE_MAX_BUFFERED_EVENTS,
+    maxBytes: SSE_MAX_BUFFERED_BYTES,
+    idleTimeoutMs: SSE_IDLE_TIMEOUT_MS,
+    onOverflow: (info) => {
+      const delta = info.droppedEvents - lastDropped;
+      if (delta > 0) incMetric("sse_dropped_events_total", delta);
+      lastDropped = info.droppedEvents;
+    },
+    onDisconnect: teardown,
+  });
 
-  if ("result" in simResponse && simResponse.result) {
-    const val = scValToNative(simResponse.result.retval);
-    return typeof val === "number" ? val : Number(val);
-  }
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Bind the controller so pushes can drain while the consumer has demand.
+      buffer.attach(controller);
 
-  return 0;
-}
+      // Track the open connection on the `ophirpay_sse_open_connections`
+      // gauge (visible on /api/metrics).
+      incMetric("sse_open_connections");
 
-/**
- * Read a PaymentEvent from the emitter contract by ID.
- */
-async function readEmitterEvent(
-  server: rpc.Server,
-  contractId: string,
-  eventId: number,
-  sourcePublicKey: string,
-): Promise<Record<string, unknown> | null> {
-  const contract = new Contract(contractId);
-  const account = await server.getAccount(sourcePublicKey);
+      // Heartbeat every 15s to keep the connection alive through proxies.
+      heartbeat = setInterval(() => {
+        buffer.push("heartbeat", { timestamp: Date.now() });
+      }, SSE_HEARTBEAT_MS);
 
-  const tx = new TransactionBuilder(account, {
-    fee: "100000",
-    networkPassphrase: NETWORK_PASSPHRASE,
-    timebounds: { minTime: 0, maxTime: 0 },
-  })
-    .addOperation(contract.call("get_event", nativeToScVal(eventId)))
-    .build();
+      // Poll the emitter contract and forward normalized events.
+      source = createLiveEventSource();
+      source.start((event) => buffer.push(event.event, event));
 
-  const simResponse = await server.simulateTransaction(tx);
+      // Initial connected event.
+      buffer.push("connected", {
+        message: "SSE stream connected to emitter contract",
+      });
 
-  if ("error" in simResponse && simResponse.error) {
-    return null;
-  }
-
-  if ("result" in simResponse && simResponse.result) {
-    try {
-      const native = scValToNative(simResponse.result.retval);
-      return native as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
-}
-
-export async function GET() {
-  const encoder = new TextEncoder();
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      let closed = false;
-      let lastKnownCount = 0;
-      const server = new rpc.Server(SOROBAN_RPC_URL, { allowHttp: false });
-
-      // Use the configured chain-read source account for simulation
-      const sourcePublicKey = CHAIN_READ_SOURCE;
-
-      // Heartbeat every 15s to keep connection alive
-      const heartbeat = setInterval(() => {
-        if (closed) return;
-        try {
-          controller.enqueue(
-            encoder.encode(
-              `event: heartbeat\ndata: ${JSON.stringify({ timestamp: Date.now() })}\n\n`,
-            ),
-          );
-        } catch {
-          closed = true;
-        }
-      }, 15000);
-
-      // Poll emitter contract every 10 seconds for new events
-      const pollEmitter = async () => {
-        if (closed) return;
-        try {
-          const currentCount = await readEmitterU64(
-            server,
-            EMITTER_CONTRACT_ID,
-            "get_event_count",
-            sourcePublicKey,
-          );
-
-          // Fetch any new events since last poll
-          let lastFetched = lastKnownCount;
-          for (let id = lastKnownCount + 1; id <= currentCount; id++) {
-            const event = await readEmitterEvent(
-              server,
-              EMITTER_CONTRACT_ID,
-              id,
-              sourcePublicKey,
-            );
-
-            if (event) {
-              const payload = {
-                event: "payment:created",
-                timestamp: new Date().toISOString(),
-                paymentId: `evt_${event.id || id}`,
-                status: "COMPLETED",
-                emitter: event.emitter || "OphirPay",
-                payer: event.payer || "",
-                payee: event.payee || "",
-                amount: event.amount || "0",
-                txHash: event.tx_hash || "",
-              };
-              controller.enqueue(
-                encoder.encode(
-                  `event: payment:created\ndata: ${JSON.stringify(payload)}\n\n`,
-                ),
-              );
-              lastFetched = id;
-            } else {
-              // Stop on first failure — retry next poll cycle
-              break;
-            }
-          }
-
-          lastKnownCount = lastFetched;
-        } catch {
-          // Polling failed — silently retry next cycle
-        }
-      };
-
-      // Initial connected event
-      controller.enqueue(
-        encoder.encode(
-          `event: connected\ndata: ${JSON.stringify({ message: "SSE stream connected to emitter contract" })}\n\n`,
-        ),
-      );
-
-      // Get starting count
-      try {
-        lastKnownCount = await readEmitterU64(
-          server,
-          EMITTER_CONTRACT_ID,
-          "get_event_count",
-          sourcePublicKey,
-        );
-      } catch {
-        lastKnownCount = 0;
-      }
-
-      // Start polling
-      const pollInterval = setInterval(pollEmitter, 10000);
-      // Run immediately too
-      pollEmitter();
-
-      // Cleanup
-      return () => {
-        closed = true;
-        clearInterval(heartbeat);
-        clearInterval(pollInterval);
-      };
+      // Teardown when the request is aborted; stream cancellation also invokes
+      // the cancel callback below.
+      request.signal.addEventListener("abort", teardown, { once: true });
+    },
+    pull(controller) {
+      buffer.pull(controller);
+    },
+    cancel() {
+      teardown();
     },
   });
 
@@ -216,4 +114,4 @@ export async function GET() {
       "X-Accel-Buffering": "no",
     },
   });
-}
+});
